@@ -6,6 +6,7 @@
                  [posh "0.5.5"]
                  [datascript "0.15.5"]
                  [bidi "2.0.16"]
+                 [kibu/pushy "0.3.7"]
                  [venantius/accountant "0.1.9"]]
 
   :plugins [[lein-cljsbuild "1.1.4"]]
@@ -34,7 +35,8 @@
   :cljsbuild
   {:builds
    [{:id           "dev"
-     :source-paths ["src/cljs"]
+     :source-paths ["src/cljs"
+                    "src/clj"]
      :figwheel     {:on-jsload "datival.core/mount-root"}
      :compiler     {:main                 datival.core
                     :output-to            "resources/public/js/compiled/app.js"

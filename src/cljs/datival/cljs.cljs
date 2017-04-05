@@ -1,22 +1,24 @@
 (ns datival.cljs
   (:require [clojure.data :as data]
             [reagent.core :as reagent]
-            [re-frame.core :as re-frame]
-            [datival.events]
-            [datival.subs]
-            [datival.views :as views]
-            [datival.config :as config]
             [datascript.core :as d]
             [posh.reagent :as posh]
             [reagent.ratom :as r]
             [clojure.spec :as s]
             [cljs.reader :refer [read-string]]
             [bidi.bidi :as bidi]
-            [accountant.core :as accountant]
-            )
-  (:import goog.history.Html5History))
+            [posh.reagent :as p]
+            [pushy.core :as pushy]))
 
-(defonce history (Html5History.))
+(defn make-ui [conn query funcs]
+  (let [funcs (merge {:id (fn [_] [:db/role :anchor])
+                      :setup (fn [_] nil)}
+                     funcs)]
+    (fn [& args]
+      ((:setup funcs) args)
+      (fn [& args]
+        (let [res @(p/pull conn query ((:id funcs) args))]
+          ((:render funcs) (conj args res)))))))
 
 (def tempid-atom (atom -1))
 (defn tempid []
@@ -119,6 +121,7 @@
   (->> (concat (map #(-> [% {:db/unique :db.unique/identity
                              :db/index true}]) (:ident schema))
                (map #(-> [% {:db/valueType :db.type/ref
+                             :db/cardinality :db.cardinality/one
                              :db/isComponent true}]) (:single-ref schema))
                (map #(-> [% {:db/valueType :db.type/ref
                              :db/cardinality :db.cardinality/many
@@ -208,16 +211,16 @@
          (transact! true :storage-listener conn (-> % .-newValue read-string)))))))
 
 (defn set-up-db [schema]
-  (let [conn (-> schema
+  (let [c (-> schema
                  (update :ident #(conj % :db/role))
                  (update :ident #(conj % :route/title))
                  (update :single-ref #(conj % :route/child))
                  (update :single-ref #(conj % :route/dependency))
                  make-schema
                  d/create-conn)]
-    (posh/posh! conn)
-    (transact! true :initialize-db conn [{:db/id (tempid) :db/role :anchor}])
-    conn))
+    (posh/posh! c)
+    (transact! true :initialize-db c [{:db/id (tempid) :db/role :anchor}])
+    c))
 
 (defn add-dependecy
   ([c t r] (add-dependecy c t r nil))
@@ -292,18 +295,13 @@
                                                 :route/title :error}])
   (doseq [{:keys [dependency title struct]} (make-route-structures routes)]
     (add-dependecy conn title struct dependency))
-  (accountant/configure-navigation!
-   {:nav-handler (fn [path]
-                   (let [path (if (= (subs (.getToken history) 0 2) "/#")
-                                (subs (.getToken history) 2)
-                                (.getToken history))
+  (pushy/start! (pushy/pushy
+                 (partial transact! true :routing-path conn)
+                 (fn [_]
+                   (let [path (-> js/window .-location .-hash (subs 1))
                          nav-datoms (get-nav-datoms conn path)]
                      (if (every? #(not= % :dne) nav-datoms)
-                       (transact! true :routing-path conn nav-datoms)
-                       (transact! true :no-route conn [{:db/id [:route/title :lead]
-                                                        :route/child [:route/title :error]}]))))
-    :path-exists? (fn [path]
-                    (every? #(not= % :dne) (get-nav-datoms conn (subs path 2)))
-                    )})
-  (accountant/dispatch-current!)
-  )
+                       nav-datoms
+                       [{:db/id [:route/title :lead]
+                         :route/child [:route/title :error]}])
+                     )))))
