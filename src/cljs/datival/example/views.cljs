@@ -1,6 +1,6 @@
-(ns datival.views
-  (:require [datival.conn :as conn]
-            [datival.cljs :as dv]))
+(ns datival.example.views
+  (:require [datival.example.conn :as conn]
+            [datival.core :as dv]))
 
 (def sub-panel
   (dv/make-ui conn/conn

@@ -1,4 +1,5 @@
-(ns datival.conn (:require [datival.cljs :as dv]))
+(ns datival.example.conn
+  (:require [datival.core :as dv]))
 
 (def schema
   {:ident      [:user/name

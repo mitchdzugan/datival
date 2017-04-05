@@ -2,12 +2,10 @@
   :dependencies [[org.clojure/clojure "1.8.0"]
                  [org.clojure/clojurescript "1.9.494"]
                  [reagent "0.6.1"]
-                 [re-frame "0.9.2"]
                  [posh "0.5.5"]
                  [datascript "0.15.5"]
                  [bidi "2.0.16"]
-                 [kibu/pushy "0.3.7"]
-                 [venantius/accountant "0.1.9"]]
+                 [kibu/pushy "0.3.7"]]
 
   :plugins [[lein-cljsbuild "1.1.4"]]
 
@@ -37,8 +35,8 @@
    [{:id           "dev"
      :source-paths ["src/cljs"
                     "src/clj"]
-     :figwheel     {:on-jsload "datival.core/mount-root"}
-     :compiler     {:main                 datival.core
+     :figwheel     {:on-jsload "datival.example.example/mount-root"}
+     :compiler     {:main                 datival.example.example
                     :output-to            "resources/public/js/compiled/app.js"
                     :output-dir           "resources/public/js/compiled/out"
                     :asset-path           "js/compiled/out"
@@ -49,7 +47,7 @@
 
     {:id           "min"
      :source-paths ["src/cljs"]
-     :compiler     {:main            datival.core
+     :compiler     {:main            datival.example.example
                     :output-to       "resources/public/js/compiled/app.js"
                     :optimizations   :advanced
                     :closure-defines {goog.DEBUG false}
