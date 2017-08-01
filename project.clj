@@ -1,11 +1,13 @@
 (defproject datival "0.1.0-SNAPSHOT"
   :dependencies [[org.clojure/clojure "1.8.0"]
                  [org.clojure/clojurescript "1.9.494"]
+                 [org.clojure/core.async "0.3.443"]
                  [reagent "0.6.1"]
                  [posh "0.5.5"]
                  [datascript "0.15.5"]
                  [bidi "2.0.16"]
-                 [kibu/pushy "0.3.7"]]
+                 [kibu/pushy "0.3.7"]
+                 [cljs-ajax "0.5.8"]]
 
   :plugins [[lein-cljsbuild "1.1.4"]]
 

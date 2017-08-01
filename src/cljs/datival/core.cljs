@@ -1,4 +1,5 @@
 (ns datival.core
+  (:require-macros [cljs.core.async.macros :refer [go go-loop]])
   (:require [clojure.data :as data]
             [datascript.core :as d]
             [posh.reagent :as posh]
@@ -6,7 +7,18 @@
             [clojure.spec :as s]
             [cljs.reader :refer [read-string]]
             [bidi.bidi :as bidi]
-            [pushy.core :as pushy]))
+            [pushy.core :as pushy]
+            [cljs.core.async :refer [put! chan <! >! timeout close!]]
+            [ajax.core :as ajax]
+            [goog.net.ErrorCode :as errors]))
+
+(defn leaves
+  ([m] (leaves m []))
+  ([m l] (if (map? m) (reduce (fn [l [k v]] (concat l (leaves v))) l m) [m])))
+
+(defn map-leaves
+  [f m]
+  (if (map? m) (->> m (map (fn [[k v]] [k (map-leaves f v)])) (into {})) (f m)))
 
 (defn make-ui [conn query funcs]
   (let [funcs (merge {:id (fn [_] [:db/role :anchor])
@@ -88,31 +100,28 @@
                             (mapcat use-retract-path))]
         (d/transact! conn new-datoms)))))
 
+
+
+(def log (js/console.log.bind js/console))
+(def log-group (if (.-group js/console)         ;; console.group does not exist  < IE 11
+                  (js/console.group.bind js/console)
+                  (js/console.log.bind   js/console)))
+(def log-group-end (if (.-groupEnd js/console)        ;; console.groupEnd does not exist  < IE 11
+                      (js/console.groupEnd.bind js/console)
+                      #()))
+
 (defn transact!
-  ([debug? conn datoms] (transact! debug? :no-tag conn datoms))
-  ([debug? tag conn datoms]
-   (let [log (js/console.log.bind js/console)
-         log-group (if (.-group js/console)         ;; console.group does not exist  < IE 11
-                     (js/console.group.bind js/console)
-                     (js/console.log.bind   js/console))
-         log-group-end (if (.-groupEnd js/console)        ;; console.groupEnd does not exist  < IE 11
-                         (js/console.groupEnd.bind js/console)
-                         #())
-         orig-db (if (and debug?
-                          (->> [:db/role :anchor]
-                               (d/entity (d/db conn))
-                               :db/id))
-                   (d/pull (d/db conn) '[*] [:db/role :anchor]))
-         ]
-     (handle-transaction conn datoms)
-     (let [[only-before only-after] (if debug? (data/diff orig-db (d/pull (d/db conn) '[*] [:db/role :anchor])))
-           db-changed? (or (some? only-before) (some? only-after))]
-       (if db-changed?
-         (do (log-group "datascript diff for:" tag)
-             (log "only before:" only-before)
-             (log "only after :" only-after)
-             (log-group-end))
-         (log "no datascript changes caused by:" tag))))))
+  [debug? conn datoms]
+  (let [orig-db (if (and debug?
+                         (->> [:db/role :anchor]
+                              (d/entity (d/db conn))
+                              :db/id))
+                  (d/pull (d/db conn)
+
+                          '[*]
+                          [:db/role :anchor]))]
+    (handle-transaction conn datoms)
+    (if debug? [orig-db (d/pull (d/db conn) '[*] [:db/role :anchor])])))
 
 (defn make-schema
   [schema]
@@ -191,7 +200,7 @@
      (try (let [datoms (->> storage-key (.getItem js/localStorage) read-string)]
             (if (s/valid? (s/coll-of (fn [{:keys [db/id]}] (or (int? id)
                                                                (= id [:db/role :anchor])))) datoms)
-              (transact! true :storage-init conn datoms)))
+              (transact! true conn datoms)))
           (catch js/Object e (println e)))
      (let [dratoms (pull-datoms-reaction conn selector eid)]
        (r/run! (->> @dratoms
@@ -206,7 +215,7 @@
       #(if (=
             storage-key
             (.-key %))
-         (transact! true :storage-listener conn (-> % .-newValue read-string)))))))
+         (transact! true conn (-> % .-newValue read-string)))))))
 
 (defn set-up-db [schema]
   (let [c (-> schema
@@ -217,17 +226,14 @@
                  make-schema
                  d/create-conn)]
     (posh/posh! c)
-    (transact! true :initialize-db c [{:db/id (tempid) :db/role :anchor}])
+    (transact! true c [{:db/id (tempid) :db/role :anchor}])
     c))
 
 (defn add-dependecy
   ([c t r] (add-dependecy c t r nil))
   ([conn title routes dependency]
    (let [child-id (tempid)]
-     (transact! true [:add-child-router
-                      title
-                      dependency
-                      [routes]]
+     (transact! true
                 conn [(->> {:db/id child-id
                             :route/title title
                             :route/struct routes
@@ -289,17 +295,157 @@
 
 (defn set-up-routing
   [conn routes]
-  (transact! true [:setup-routing-error] conn [{:db/id (tempid)
+  (transact! true conn [{:db/id (tempid)
                                                 :route/title :error}])
   (doseq [{:keys [dependency title struct]} (make-route-structures routes)]
     (add-dependecy conn title struct dependency))
   (pushy/start! (pushy/pushy
-                 (partial transact! true :routing-path conn)
+                 (partial transact! true conn)
                  (fn [_]
                    (let [path (-> js/window .-location .-hash (subs 1))
                          nav-datoms (get-nav-datoms conn path)]
                      (if (every? #(not= % :dne) nav-datoms)
                        nav-datoms
                        [{:db/id [:route/title :lead]
-                         :route/child [:route/title :error]}])
-                     )))))
+                         :route/child [:route/title :error]}]))))))
+
+(defn deep-merge [m1 m2]
+  (merge-with
+   (fn [v1 v2]
+     (cond (every? map? [v1 v2]) (deep-merge v1 v2)
+           (every? coll? [v1 v2]) (concat v1 v2)
+           :else v2)) m1 m2))
+
+(defn log-diffs [tag s1 s2]
+  (let [[only-before only-after] (data/diff s1 s2)
+        changed? (or (some? only-before) (some? only-after))]
+    (if changed?
+      (do (log-group "sink diff for subsystem:" tag)
+          (log "only before:" only-before)
+          (log "only-after:" only-after)
+          (log-group-end))
+      (log "no sink change for subsystem:" tag))))
+
+
+(defn ajax-xhrio-handler
+  "ajax-request only provides a single handler for success and errors"
+  [on-success on-failure xhrio [success? response]]
+  ; see http://docs.closure-library.googlecode.com/git/class_goog_net_XhrIo.html
+  (if success?
+    (on-success response)
+    (let [details (merge
+                    {:uri             (.getLastUri xhrio)
+                     :last-method     (.-lastMethod_ xhrio)
+                     :last-error      (.getLastError xhrio)
+                     :last-error-code (.getLastErrorCode xhrio)
+                     :debug-message   (-> xhrio .getLastErrorCode (errors/getDebugMessage))}
+                    response)]
+      (on-failure details))))
+
+
+(defn request->xhrio-options
+  [dispatch
+   {:as   request
+    :keys [on-success on-failure]
+    :or   {on-success      [:http-no-on-success]
+           on-failure      [:http-no-on-failure]}}]
+  ; wrap events in cljs-ajax callback
+  (let [api (new js/goog.net.XhrIo)]
+    (-> request
+        (assoc
+          :api     api
+          :handler (partial ajax-xhrio-handler
+                            #(dispatch (conj on-success %))
+                            #(dispatch (conj on-failure %))
+                            api))
+        (dissoc :on-success :on-failure))))
+
+(def ajax-system
+  {:sinks {:ajax (fn [dispatch request]
+                   (let [seq-request-maps (if (sequential? request) request [request])]
+                     (doseq [request seq-request-maps]
+                       (-> request (request->xhrio-options dispatch) ajax/ajax-request))))}})
+
+(defn datascript-system
+  [debug? conn]
+  {:sources {:datascript (fn [_] @conn)}
+   :sinks {:datascript (fn [dispatch datoms] (transact! debug? conn datoms))}})
+
+(def dispatch-system
+  {:sinks {:dispatch (fn [dispatch [event args]] (dispatch event args))
+           :dispatch-after (fn [dispatch [ms event args]] (js/setTimeout #(dispatch event args) ms))}})
+
+(defn route-builder [routes path]
+  (if (coll? routes)
+    (->> routes
+         (map (fn [[k v]]
+                (if-let [new-step (-> v meta keys first)]
+                  [k (route-builder v (concat path [new-step]))]
+                  [k (route-builder v path)])))
+         (into {}))
+    [routes path]))
+
+(defn route-system
+  [routes]
+  (let [routes (route-builder routes [])
+        leaves (leaves routes)
+        leaf-to-sym (fn [[leaf path]] (symbol (str leaf (reduce str "" (map str path)))))
+        leaves (->> leaves (map (fn [leaf] [(leaf-to-sym leaf) leaf])) (into {}))
+        routes (map-leaves leaf-to-sym routes)
+        routes (mapcat identity routes)]
+    {:events {:setup-routing {:body (fn [state args] {:start-pushy routes})}
+              :set-route {:body (fn [state bidi-res]
+                                  {:state (deep-merge state
+                                                      {:_routing {:current-route
+                                                                  (merge bidi-res {:handler
+                                                                                   (get leaves (:handler bidi-res))})}})})}}
+     :sinks {:start-pushy (fn [dispatch routes]
+                            (pushy/start! (pushy/pushy (partial dispatch :set-route)
+                                                       (fn [_] (let [path (-> js/window .-location .-hash (subs 1))]
+                                                                 (bidi/match-route routes path))))))}
+     :initial-dispatching [[:setup-routing]]}))
+
+
+(defn make-event-system
+  [debug? configs]
+  (let [c (chan)
+        initial-state {:_config (reduce deep-merge
+                                        (if debug? {:debug []} {})
+                                        (->> configs
+                                             (map (fn [config] (-> config
+                                                                   (dissoc :initial-dispatching)
+                                                                   (update :events #(->> %
+                                                                                         (map (fn [[k v]] [k (merge {:sources []} v)]))
+                                                                                         (into {}))))))))}
+        dispatch (fn [event args] (go (>! c [event args])))]
+
+    (defn process-event
+      [state event-tag args]
+      (let [event (get-in state [:_config :events event-tag])
+            all-sources (get-in state [:_config :sources])
+            all-sinks (get-in state [:_config :sinks])
+            args (merge args (into {} (map #(-> [% ((% all-sources) args)]) (:sources event))))
+            result (merge {:state state} ((:body event) state args))
+            ]
+        [(:state result) (->> (dissoc result :state)
+                              (map (fn [[sink args]] [sink ((sink all-sinks) dispatch args)])))]))
+
+    (defn process-event-wrapper
+      [state event-tag args]
+      (let [[new-state sink-results] (process-event state event-tag args)]
+        (if debug? (do
+                     (log-group "Event subsystem  changes for event:" event-tag args)
+                     (log-diffs :state state new-state)
+                     (doseq [[sink [s1 s2]] sink-results]
+                       (if (or s1 s2) (log-diffs sink s1 s2)))
+                     (log-group-end)))
+        new-state))
+
+    (let [post-initial-dispatching-state (->> configs
+                                              (mapcat :initial-dispatching)
+                                              (reduce (fn [state [event-tag args]]
+                                                        (process-event-wrapper state event-tag args))
+                                                      initial-state))]
+      (go-loop [state post-initial-dispatching-state]
+        (let [[event-tag args] (<! c)] (recur (process-event-wrapper state event-tag args)))))
+    dispatch))
