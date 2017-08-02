@@ -103,23 +103,20 @@
 
 
 (def log (js/console.log.bind js/console))
-(def log-group (if (.-group js/console)         ;; console.group does not exist  < IE 11
-                  (js/console.group.bind js/console)
-                  (js/console.log.bind   js/console)))
-(def log-group-end (if (.-groupEnd js/console)        ;; console.groupEnd does not exist  < IE 11
-                      (js/console.groupEnd.bind js/console)
-                      #()))
+(def log-group (if (.-group js/console)
+                 (js/console.group.bind js/console)
+                 (js/console.log.bind   js/console)))
+(def log-group-end (if (.-groupEnd js/console)
+                     (js/console.groupEnd.bind js/console)
+                     #()))
 
 (defn transact!
   [debug? conn datoms]
-  (let [orig-db (if (and debug?
-                         (->> [:db/role :anchor]
-                              (d/entity (d/db conn))
-                              :db/id))
-                  (d/pull (d/db conn)
-
-                          '[*]
-                          [:db/role :anchor]))]
+  (let [id (or (:id debug?) [:db/role :anchor])
+        selector (or (:selector debug?) '[*])
+        orig-db (if (and debug?
+                         (->> id (d/entity (d/db conn)) :db/id))
+                  (d/pull (d/db conn) selector id))]
     (handle-transaction conn datoms)
     (if debug? [orig-db (d/pull (d/db conn) '[*] [:db/role :anchor])])))
 
@@ -368,8 +365,13 @@
 
 (defn datascript-system
   [debug? conn]
-  {:sources {:datascript (fn [_] @conn)}
-   :sinks {:datascript (fn [dispatch datoms] (transact! debug? conn datoms))}})
+  {:events {:setup-local-sync {:body (fn [state {:keys [selector key]}] {:start-local-sync [selector key]})}}
+   :sources {:datascript (fn [_] @conn)}
+   :sinks {:datascript (fn [dispatch datoms] (transact! debug? conn datoms))
+           :start-local-sync (fn [_ [selector key]] (sync-local-storage conn selector key) nil)}
+   :initial-dispatching (if-let [local-storage-args (:sync-local-storage debug?)]
+                          [[:setup-local-sync local-storage-args]]
+                          [])})
 
 (def dispatch-system
   {:sinks {:dispatch (fn [dispatch [event args]] (dispatch event args))
@@ -385,25 +387,29 @@
          (into {}))
     [routes path]))
 
+(defn datascript-set-route-event-res
+  [state bidi-res]
+  {:datascript [{:db/path [[:db/role :anchor]]
+                 :root/routing bidi-res}]})
+
 (defn route-system
-  [routes]
-  (let [routes (route-builder routes [])
-        leaves (leaves routes)
-        leaf-to-sym (fn [[leaf path]] (symbol (str leaf (reduce str "" (map str path)))))
-        leaves (->> leaves (map (fn [leaf] [(leaf-to-sym leaf) leaf])) (into {}))
-        routes (map-leaves leaf-to-sym routes)
-        routes (mapcat identity routes)]
-    {:events {:setup-routing {:body (fn [state args] {:start-pushy routes})}
-              :set-route {:body (fn [state bidi-res]
-                                  {:state (deep-merge state
-                                                      {:_routing {:current-route
-                                                                  (merge bidi-res {:handler
-                                                                                   (get leaves (:handler bidi-res))})}})})}}
-     :sinks {:start-pushy (fn [dispatch routes]
-                            (pushy/start! (pushy/pushy (partial dispatch :set-route)
-                                                       (fn [_] (let [path (-> js/window .-location .-hash (subs 1))]
-                                                                 (bidi/match-route routes path))))))}
-     :initial-dispatching [[:setup-routing]]}))
+  ([routes] (route-system routes {}))
+  ([routes {:keys [from-location make-set-route-event-res]}]
+   (let [routes (route-builder routes [])
+         leaves (leaves routes)
+         leaf-to-sym (fn [[leaf path]] (symbol (str leaf (reduce str "" (map str path)))))
+         leaves (->> leaves (map (fn [leaf] [(leaf-to-sym leaf) leaf])) (into {}))
+         routes (map-leaves leaf-to-sym routes)
+         routes (mapcat identity routes)
+         from-location (or from-location #(-> % .-hash (subs 1)))
+         make-set-route-event-res (or make-set-route-event-res (fn [state bidi-res] {:state (deep-merge state {:routing {:current-route (merge bidi-res {:handler (get leaves {:handler bidi-res})})}})}))]
+     {:events {:setup-routing {:body (fn [state args] {:start-pushy routes})}
+               :set-route {:body (fn [state bidi-res] (make-set-route-event-res state (merge bidi-res {:handler (get leaves (:handler bidi-res))})))}}
+      :sinks {:start-pushy (fn [dispatch routes]
+                             (pushy/start! (pushy/pushy (partial dispatch :set-route)
+                                                        (fn [_] (bidi/match-route routes
+                                                                                  (from-location (.-location js/window)))))))}
+      :initial-dispatching [[:setup-routing]]})))
 
 
 (defn make-event-system
@@ -434,7 +440,7 @@
       [state event-tag args]
       (let [[new-state sink-results] (process-event state event-tag args)]
         (if debug? (do
-                     (log-group "Event subsystem  changes for event:" event-tag args)
+                     (log-group "Event subsystem  changes for event:" event-tag (dissoc args :key)) ;; TODO: chrome can't handle strings in these dics for some reason
                      (log-diffs :state state new-state)
                      (doseq [[sink [s1 s2]] sink-results]
                        (if (or s1 s2) (log-diffs sink s1 s2)))

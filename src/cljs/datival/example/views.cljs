@@ -4,8 +4,8 @@
 
 (def sub-panel
   (dv/make-ui conn/conn
-              [{:root/auth [{:auth/current-user [:user/name]}]}]
-              {:render (fn [[res]] [:p (str res)])}))
+              [{:root/routing [:handler]}]
+              {:render (fn [res] [:p (str res)])}))
 
 (def main-panel
   (dv/make-ui conn/conn

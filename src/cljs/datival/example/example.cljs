@@ -7,44 +7,29 @@
             [datival.example.conn :as c]))
 
 (defn do-stuff []
-  (let [t! (partial dv/transact! true)
-        conn c/conn]
-    (println [:dm (dv/deep-merge {:a [1 2] :b {:c :d} :g :h :j :k :l :m}
-                                 {:a [3 4] :b {:e :f} :g :i :j [] :l {}})])
-    (dv/sync-local-storage conn [{:root/auth [:db/id]}] "datoms")
-    (t! conn [{:db/path [[:db/role :anchor] :root/auth :auth/current-user]
-                        :user/name 124
-                        :user/swag 9001}])
-    (t! conn [{:db/retract-path [[:db/role :anchor] :root/auth :auth/current-user :current-user/swag]}])
-    #_(dv/set-up-routing conn
-                       [["/" [:root
-                                {"index.html" :index
-                                 "articles/" [:article-r
-                                              {"index.html" :article-index
-                                               [:id1 "/" :id2] :article}]}]]
-                        ["asd" :asd]]
-                       )
-    (reagent/render [:div
-                     [views/main-panel [:route/title :lead]]
-                     [views/sub-panel]]
-                    (.getElementById js/document "app"))))
+  )
 
 (defn dev-setup []
   (when config/debug?
     (enable-console-print!)
-    (println "dev mode")))
+    (println "dev mode ")))
 
 (defn mount-root []
-  (let [dispatch (dv/make-event-system true [(dv/route-system {"/" {"index.html" :index
-                                                                    "articles/" ^:article {"index.html" :index}}})
+  (let [dispatch (dv/make-event-system true [dv/dispatch-system dv/ajax-system
+                                             (dv/datascript-system {:sync-local-storage {:selector [{:root/routing [:handler]}]
+                                                                                         :key "datoms"}} c/conn)
+                                             (dv/route-system {"/" {"index.html" :index
+                                                                    "articles/" ^:article {"index.html" :index}}}
+                                                              {:make-set-route-event-res dv/datascript-set-route-event-res})
                                              {:events {:event1 {:sources [:source1]
                                                                           :body (fn [state args] {:state (merge state args)
                                                                                                   :sink1 :sink-value})}}
                                                         :sources {:source1 (fn [_] :source-value)}
                                                         :sinks {:sink1 (fn [dispatch args] (println args) [1 2])}}])]
     (dispatch :event1 {:my-args :event-args}))
-  (do-stuff)
-  )
+  (reagent/render [:div
+                   [views/sub-panel]]
+                  (.getElementById js/document "app")))
 
 (defn ^:export init []
   (dev-setup)
