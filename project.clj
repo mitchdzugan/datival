@@ -13,7 +13,8 @@
 
   :min-lein-version "2.5.3"
 
-  :source-paths ["src/clj"]
+  :source-paths ["src/cljs"
+                 "src/clj" ]
 
   :clean-targets ^{:protect false} ["resources/public/js/compiled" "target"
                                     "test/js"]
@@ -48,7 +49,8 @@
                     }}
 
     {:id           "min"
-     :source-paths ["src/cljs"]
+     :source-paths ["src/cljs"
+                    "src/clj" ]
      :compiler     {:main            datival.example.example
                     :output-to       "resources/public/js/compiled/app.js"
                     :optimizations   :advanced

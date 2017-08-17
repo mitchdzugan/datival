@@ -4,13 +4,21 @@
             [datascript.core :as d]
             [posh.reagent :as posh]
             [reagent.ratom :as r]
-            [clojure.spec :as s]
+            [reagent.core :as reagent]
             [cljs.reader :refer [read-string]]
             [bidi.bidi :as bidi]
             [pushy.core :as pushy]
             [cljs.core.async :refer [put! chan <! >! timeout close!]]
             [ajax.core :as ajax]
             [goog.net.ErrorCode :as errors]))
+
+(enable-console-print!)
+
+(def tempid-atom (atom -1))
+(defn tempid []
+  (let [retval @tempid-atom]
+    (swap! tempid-atom dec)
+    retval))
 
 (defn leaves
   ([m] (leaves m []))
@@ -21,20 +29,20 @@
   (if (map? m) (->> m (map (fn [[k v]] [k (map-leaves f v)])) (into {})) (f m)))
 
 (defn make-ui [conn query funcs]
-  (let [funcs (merge {:id (fn [_] [:db/role :anchor])
-                      :setup (fn [_] nil)}
+  (let [funcs (merge {:id                    (fn [_] [:db/role :anchor])
+                      :setup                 (fn [_])
+                      :component-will-update (fn [])
+                      :component-did-update  (fn [])}
                      funcs)]
     (fn [& args]
       ((:setup funcs) args)
-      (fn [& args]
-        (let [res @(posh/pull conn query ((:id funcs) args))]
-          ((:render funcs) (conj args res)))))))
-
-(def tempid-atom (atom -1))
-(defn tempid []
-  (let [retval @tempid-atom]
-    (swap! tempid-atom dec)
-    retval))
+      (reagent/create-class
+        {:key                   (tempid)
+         :component-will-update (:component-will-update funcs)
+         :component-did-update  (:component-did-update funcs)
+         :reagent-render        (fn [& args]
+                                  (let [res @(posh/pull conn query ((:id funcs) args))]
+                                    ((:render funcs) (conj args res))))}))))
 
 (defn handle-transaction [conn datoms]
   (let [path-cache (atom {})]
@@ -54,15 +62,15 @@
                         eid (or (get-in pull-res (concat (rest path) [:db/id]))
                                 (tempid))
                         datoms (conj
-                                (if-not pull-res
-                                  (let [path-init (-> path reverse rest reverse)
-                                        path-last (-> path reverse first)]
-                                    (if (> (count path-init) 1)
-                                      (use-path {:db/path path-init
-                                                 path-last eid})
-                                      [{:db/id (first path-init)
-                                        path-last eid}])))
-                                (-> datom (assoc :db/id eid) (dissoc :db/path)))]
+                                 (if-not pull-res
+                                   (let [path-init (-> path reverse rest reverse)
+                                         path-last (-> path reverse first)]
+                                     (if (> (count path-init) 1)
+                                       (use-path {:db/path  path-init
+                                                  path-last eid})
+                                       [{:db/id    (first path-init)
+                                         path-last eid}])))
+                                 (-> datom (assoc :db/id eid) (dissoc :db/path)))]
                     (swap! path-cache assoc path (-> datoms last :db/id))
                     datoms))
                 [datom]))
@@ -73,11 +81,11 @@
                                      (flatten [(get res curr)]))]
                   (if (and (:db/id res)
                            (= [] datoms))
-                    [{:db/id (:db/id res)
+                    [{:db/id     (:db/id res)
                       :attribute curr}]
                     datoms))
                 (if (:db/id res)
-                  [{:db/id (:db/id res)
+                  [{:db/id     (:db/id res)
                     :attribute nil}]
                   [])))
             (use-retract-path
@@ -105,29 +113,32 @@
 (def log (js/console.log.bind js/console))
 (def log-group (if (.-group js/console)
                  (js/console.group.bind js/console)
-                 (js/console.log.bind   js/console)))
+                 (js/console.log.bind js/console)))
 (def log-group-end (if (.-groupEnd js/console)
                      (js/console.groupEnd.bind js/console)
                      #()))
 
 (defn transact!
   [debug? conn datoms]
-  (let [id (or (:id debug?) [:db/role :anchor])
+  (let [debug? false
+        id (or (:id debug?) [:db/role :anchor])
         selector (or (:selector debug?) '[*])
         orig-db (if (and debug?
                          (->> id (d/entity (d/db conn)) :db/id))
                   (d/pull (d/db conn) selector id))]
     (handle-transaction conn datoms)
-    (if debug? [orig-db (d/pull (d/db conn) '[*] [:db/role :anchor])])))
+    (if debug? [orig-db (d/pull (d/db conn)
+                                (or (:pull debug?) '[*])
+                                (or (:id debug?) [:db/role :anchor]))])))
 
 (defn make-schema
   [schema]
   (->> (concat (map #(-> [% {:db/unique :db.unique/identity
-                             :db/index true}]) (:ident schema))
-               (map #(-> [% {:db/valueType :db.type/ref
+                             :db/index  true}]) (:ident schema))
+               (map #(-> [% {:db/valueType   :db.type/ref
                              :db/cardinality :db.cardinality/one
                              :db/isComponent true}]) (:single-ref schema))
-               (map #(-> [% {:db/valueType :db.type/ref
+               (map #(-> [% {:db/valueType   :db.type/ref
                              :db/cardinality :db.cardinality/many
                              :db/isComponent true}]) (:many-ref schema)))
        (into {})))
@@ -152,22 +163,22 @@
                  (into [] (concat datoms
                                   (cond
                                     (and
-                                     (map? v)
-                                     (contains? v :db/id))
+                                      (map? v)
+                                      (contains? v :db/id))
                                     (conj
-                                     (pull-res-to-datoms v)
-                                     {:db/id id
-                                      k (:db/id v)})
+                                      (pull-res-to-datoms v)
+                                      {:db/id id
+                                       k      (:db/id v)})
                                     (and
-                                     (sequential? v)
-                                     (every? #(and
-                                               (map? %)
-                                               (contains? % :db/id)) v))
+                                      (sequential? v)
+                                      (every? #(and
+                                                 (map? %)
+                                                 (contains? % :db/id)) v))
                                     (concat (mapcat pull-res-to-datoms v)
                                             (map #(-> {:db/id id
-                                                       k (:db/id %)}) v))
+                                                       k      (:db/id %)}) v))
                                     :else [{:db/id id
-                                            k v}]))))
+                                            k      v}]))))
                [])
        (into [])))
 
@@ -175,7 +186,7 @@
   (->> [res]
        (mapcat pull-res-to-datoms)
        (into #{})
-       (into  [])))
+       (into [])))
 
 (defn pull-datoms
   [pull-many db selector eids]
@@ -195,9 +206,8 @@
   ([conn selector eid storage-key]
    (let [root-id (-> conn d/db (d/pull [:db/id] [:db/role :anchor]) :db/id)]
      (try (let [datoms (->> storage-key (.getItem js/localStorage) read-string)]
-            (if (s/valid? (s/coll-of (fn [{:keys [db/id]}] (or (int? id)
-                                                               (= id [:db/role :anchor])))) datoms)
-              (transact! true conn datoms)))
+            ;; (if (s/valid? (s/coll-of (fn [{:keys [db/id]}] (or (int? id) (= id [:db/role :anchor])))) datoms))
+            (transact! true conn datoms))
           (catch js/Object e (println e)))
      (let [dratoms (pull-datoms-reaction conn selector eid)]
        (r/run! (->> @dratoms
@@ -207,111 +217,31 @@
                              datom)))
                     (.setItem js/localStorage storage-key))))
      (.addEventListener
-      js/window
-      "storage"
-      #(if (=
-            storage-key
-            (.-key %))
-         (transact! true conn (-> % .-newValue read-string)))))))
+       js/window
+       "storage"
+       #(if (=
+              storage-key
+              (.-key %))
+          (transact! true conn (-> % .-newValue read-string)))))))
 
 (defn set-up-db [schema]
   (let [c (-> schema
-                 (update :ident #(conj % :db/role))
-                 (update :ident #(conj % :route/title))
-                 (update :single-ref #(conj % :route/child))
-                 (update :single-ref #(conj % :route/dependency))
-                 make-schema
-                 d/create-conn)]
+              (update :ident #(conj % :db/role))
+              (update :ident #(conj % :route/title))
+              (update :single-ref #(conj % :route/child))
+              (update :single-ref #(conj % :route/dependency))
+              make-schema
+              d/create-conn)]
     (posh/posh! c)
     (transact! true c [{:db/id (tempid) :db/role :anchor}])
     c))
 
-(defn add-dependecy
-  ([c t r] (add-dependecy c t r nil))
-  ([conn title routes dependency]
-   (let [child-id (tempid)]
-     (transact! true
-                conn [(->> {:db/id child-id
-                            :route/title title
-                            :route/struct routes
-                            :route/dependency dependency}
-                           (remove (comp nil? last))
-                           (into {}))]))))
-
-(defn get-nav-datoms
-  ([conn path] (get-nav-datoms {} conn [:route/title :lead] path))
-  ([rp conn eid path]
-   (let [{:keys [route/struct route/dependency]}
-         (d/pull (d/db conn) '[:route/struct
-                               {:route/dependency [:db/id]}
-                               ] eid)
-         m-struct ["" struct]
-         {handler :handler
-          {rest :rest :as route-params} :route-params}
-         (if path (bidi/match-route m-struct path) nil)]
-     (if path
-       (concat
-        (if handler
-          (get-nav-datoms (or (dissoc route-params :rest)
-                              {}) conn [:route/title handler] rest)
-          [:dne])
-        [{:db/id (:db/id dependency)
-          :route/child [:route/title (last eid)]}
-         {:db/id eid
-          :route/params rp}])
-       [{:db/id (:db/id dependency)
-         :route/child [:route/title (last eid)]}
-        {:db/id eid
-         :route/params rp}]))))
-
-(defn make-route-structures
-  ([routes] (make-route-structures nil :lead routes))
-  ([dep title routes]
-   (let [curr-routes (->> routes
-                          (map (fn [[k v]]
-                                 (if (sequential? v)
-                                   [(if (sequential? k)
-                                      (concat k [[#".*" :rest]])
-                                      [k [#".*" :rest]])
-                                    (first v)]
-                                   [k v])))
-                          (into {})
-                          (#(-> {:title title :struct % :dependency dep})))]
-     (let [other-routes
-           (->> routes
-                (filter (fn [[_ v]] (sequential? v)))
-                (mapcat (fn [[_ [new-title routes]]]
-                          (make-route-structures [:route/title title] new-title routes)))
-                (concat (->> routes
-                             (remove (fn [[_ v]] (sequential? v)))
-                             (map (fn [[_ new-title]]
-                                    {:title new-title
-                                     :dependency [:route/title title]})))))]
-       curr-routes
-       (conj other-routes curr-routes)))))
-
-(defn set-up-routing
-  [conn routes]
-  (transact! true conn [{:db/id (tempid)
-                                                :route/title :error}])
-  (doseq [{:keys [dependency title struct]} (make-route-structures routes)]
-    (add-dependecy conn title struct dependency))
-  (pushy/start! (pushy/pushy
-                 (partial transact! true conn)
-                 (fn [_]
-                   (let [path (-> js/window .-location .-hash (subs 1))
-                         nav-datoms (get-nav-datoms conn path)]
-                     (if (every? #(not= % :dne) nav-datoms)
-                       nav-datoms
-                       [{:db/id [:route/title :lead]
-                         :route/child [:route/title :error]}]))))))
-
-(defn deep-merge [m1 m2]
-  (merge-with
-   (fn [v1 v2]
-     (cond (every? map? [v1 v2]) (deep-merge v1 v2)
-           (every? coll? [v1 v2]) (concat v1 v2)
-           :else v2)) m1 m2))
+(defn deep-merge [& m]
+  (apply merge-with
+         (fn [& v]
+           (cond (every? map? v) (apply deep-merge v)
+                 (every? coll? v) (apply concat v)
+                 :else (last v))) m))
 
 (defn log-diffs [tag s1 s2]
   (let [[only-before only-after] (data/diff s1 s2)
@@ -320,8 +250,7 @@
       (do (log-group "sink diff for subsystem:" tag)
           (log "only before:" only-before)
           (log "only-after:" only-after)
-          (log-group-end))
-      (log "no sink change for subsystem:" tag))))
+          (log-group-end)))))
 
 
 (defn ajax-xhrio-handler
@@ -341,41 +270,57 @@
 
 
 (defn request->xhrio-options
-  [dispatch
+  [{:keys [dispatch-success
+           dispatch-failure]}
    {:as   request
     :keys [on-success on-failure]
-    :or   {on-success      [:http-no-on-success]
-           on-failure      [:http-no-on-failure]}}]
+    :or   {on-success [:http-no-on-success]
+           on-failure [:http-no-on-failure]}}]
   ; wrap events in cljs-ajax callback
-  (let [api (new js/goog.net.XhrIo)]
+  (let [[_ args-succ] on-success
+        [_ args-fail] on-failure
+        api (new js/goog.net.XhrIo)]
     (-> request
         (assoc
-          :api     api
+          :api api
           :handler (partial ajax-xhrio-handler
-                            #(dispatch (conj on-success %))
-                            #(dispatch (conj on-failure %))
+                            #(dispatch-success [args-succ %])
+                            #(dispatch-failure [args-fail %])
                             api))
         (dissoc :on-success :on-failure))))
 
 (def ajax-system
-  {:sinks {:ajax (fn [dispatch request]
-                   (let [seq-request-maps (if (sequential? request) request [request])]
-                     (doseq [request seq-request-maps]
-                       (-> request (request->xhrio-options dispatch) ajax/ajax-request))))}})
+  {:sinks {:ajax {:dispatchers (fn [{[event-succ] :on-success
+                                     [event-fail] :on-failure}]
+                                 {:dispatch-success (or event-succ :http-no-on-success)
+                                  :dispatch-failure (or event-fail :http-no-on-failure)})
+                  :body        (fn [request dispatchers]
+                                 (let [seq-request-maps (if (sequential? request) request [request])]
+                                   (doseq [request seq-request-maps]
+                                     (->> request (request->xhrio-options dispatchers) ajax/ajax-request))
+                                   nil))}}})
 
 (defn datascript-system
   [debug? conn]
-  {:events {:setup-local-sync {:body (fn [state {:keys [selector key]}] {:start-local-sync [selector key]})}}
-   :sources {:datascript (fn [_] @conn)}
-   :sinks {:datascript (fn [dispatch datoms] (transact! debug? conn datoms))
-           :start-local-sync (fn [_ [selector key]] (sync-local-storage conn selector key) nil)}
+  {:events              {:setup-local-sync (fn [state {{:keys [platform selector key]} :user}]
+                                             (if (= :web platform)
+                                               {:start-local-sync [selector key]}
+                                               {}))}
+   :sources             {:datascript (fn [] @conn)}
+   :sinks               {:datascript       (fn [datoms] (transact! debug? conn datoms))
+                         :start-local-sync (fn [[selector key]] (sync-local-storage conn selector key) nil)}
    :initial-dispatching (if-let [local-storage-args (:sync-local-storage debug?)]
                           [[:setup-local-sync local-storage-args]]
                           [])})
 
 (def dispatch-system
-  {:sinks {:dispatch (fn [dispatch [event args]] (dispatch event args))
-           :dispatch-after (fn [dispatch [ms event args]] (js/setTimeout #(dispatch event args) ms))}})
+  {:sinks {:dispatch       {:dispatchers (fn [[event]] {event event})
+                            :body        (fn [[event args] dispatchers]
+                                           ((dispatchers event) args))}
+           :dispatch-after {:dispatchers (fn [[_ event]] {event event})
+                            :body        (fn [[ms event args] dispatchers]
+                                           (js/setTimeout #((dispatchers event) args) ms)
+                                           nil)}}})
 
 (defn route-builder [routes path]
   (if (coll? routes)
@@ -389,7 +334,7 @@
 
 (defn datascript-set-route-event-res
   [state bidi-res]
-  {:datascript [{:db/path [[:db/role :anchor]]
+  {:datascript [{:db/path      [[:db/role :anchor]]
                  :root/routing bidi-res}]})
 
 (defn route-system
@@ -402,49 +347,102 @@
          routes (map-leaves leaf-to-sym routes)
          routes (mapcat identity routes)
          from-location (or from-location #(-> % .-hash (subs 1)))
-         make-set-route-event-res (or make-set-route-event-res (fn [state bidi-res] {:state (deep-merge state {:routing {:current-route (merge bidi-res {:handler (get leaves {:handler bidi-res})})}})}))]
-     {:events {:setup-routing {:body (fn [state args] {:start-pushy routes})}
-               :set-route {:body (fn [state bidi-res] (make-set-route-event-res state (merge bidi-res {:handler (get leaves (:handler bidi-res))})))}}
-      :sinks {:start-pushy (fn [dispatch routes]
-                             (pushy/start! (pushy/pushy (partial dispatch :set-route)
-                                                        (fn [_] (bidi/match-route routes
-                                                                                  (from-location (.-location js/window)))))))}
+         make-set-route-event-res (or make-set-route-event-res (fn [state {bidi-res :user}] {:state (deep-merge state {:routing {:current-route (merge bidi-res {:handler (get leaves {:handler bidi-res})})}})}))]
+     {:events              {:setup-routing (fn [state args] {:start-pushy routes})
+                            :set-route     {:sources [:location]
+                                            :body    (fn [state args]
+                                                       (make-set-route-event-res state
+                                                                                 (update-in args [:user :handler] #(get leaves %))))}}
+      :sources             {:location (fn [] (.-location js/window))}
+      :sinks               {:start-pushy {:dispatchers [:set-route]
+                                          :body        (fn [routes {dispatch :set-route}]
+                                                         (pushy/start!
+                                                           (pushy/pushy dispatch
+                                                                        (fn [_]
+                                                                          (bidi/match-route routes
+                                                                                            (from-location (.-location js/window)))))))}}
       :initial-dispatching [[:setup-routing]]})))
 
+(defn filter-with-acc
+  ([f l] (filter-with-acc f nil l))
+  ([f i l]
+   (last (reduce (fn [[acc l] v]
+                   (let [[new-acc use?] (f acc v)]
+                     [new-acc (if use? (conj l v) l)])) [i []] l))))
 
 (defn make-event-system
   [debug? configs]
-  (let [c (chan)
+  (let [make-uniform #(update %1 %2
+                              (fn [config]
+                                (->> config
+                                     (map (fn [[k v]]
+                                            (let [optional-key ({:sources :dependencies
+                                                                 :sinks   :dispatchers
+                                                                 :events  :sources} %2)]
+                                              (if (map? v)
+                                                [k (merge {optional-key []} v)]
+                                                [k {optional-key [] :body v}]))))
+                                     (into {}))))
+        c (chan)
         initial-state {:_config (reduce deep-merge
-                                        (if debug? {:debug []} {})
+                                        {}
                                         (->> configs
-                                             (map (fn [config] (-> config
-                                                                   (dissoc :initial-dispatching)
-                                                                   (update :events #(->> %
-                                                                                         (map (fn [[k v]] [k (merge {:sources []} v)]))
-                                                                                         (into {}))))))))}
-        dispatch (fn [event args] (go (>! c [event args])))]
+                                             (map (fn [config]
+                                                    (-> config
+                                                        (dissoc :initial-dispatching)
+                                                        (make-uniform :events)
+                                                        (make-uniform :sources)
+                                                        (make-uniform :sinks))))))}
+        state-atom (atom initial-state)
+        dispatch (fn [event args] (go (>! c [event args])) nil)
+        get-state #(-> @state-atom)]
 
     (defn process-event
       [state event-tag args]
-      (let [event (get-in state [:_config :events event-tag])
+      (let [event (or (get-in state [:_config :events event-tag])
+                      {:body (fn [_ args]
+                               (if debug?
+                                 (log "Unknown event: " event-tag))
+                               {})})
             all-sources (get-in state [:_config :sources])
             all-sinks (get-in state [:_config :sinks])
-            args (merge args (into {} (map #(-> [% ((% all-sources) args)]) (:sources event))))
-            result (merge {:state state} ((:body event) state args))
-            ]
+            args (->> event
+                      :sources
+                      (mapcat #(conj (get-in all-sources [% :dependencies]) %))
+                      (filter-with-acc (fn [used source]
+                                         [(clojure.set/union used #{source}) (not (used source))])
+                                       #{})
+                      (reduce (fn [args source]
+                                (merge args {source ((:body (source all-sources)) args)}))
+                              {:user args}))
+            result (merge {:state state} ((:body event) state args))]
         [(:state result) (->> (dissoc result :state)
-                              (map (fn [[sink args]] [sink ((sink all-sinks) dispatch args)])))]))
+                              (map (fn [[sink args]]
+                                     (let [{:keys [body dispatchers]} (all-sinks sink)
+                                           dispatchers (if (fn? dispatchers)
+                                                         (->> (dispatchers args)
+                                                              (map (fn [[k e]]
+                                                                     [k #(dispatch e %)]))
+                                                              (into {}))
+                                                         (->> dispatchers
+                                                              (map (fn [e]
+                                                                     [e #(dispatch e %)]))
+                                                              (into {})))]
+                                       [sink ((:body (sink all-sinks)) args dispatchers)]))))]))
 
     (defn process-event-wrapper
       [state event-tag args]
       (let [[new-state sink-results] (process-event state event-tag args)]
-        (if debug? (do
-                     (log-group "Event subsystem  changes for event:" event-tag (dissoc args :key)) ;; TODO: chrome can't handle strings in these dics for some reason
-                     (log-diffs :state state new-state)
-                     (doseq [[sink [s1 s2]] sink-results]
-                       (if (or s1 s2) (log-diffs sink s1 s2)))
-                     (log-group-end)))
+        (if debug? (log-group "Event subsystem  changes for event:"
+                              ;; TODO: chrome can't handle strings in these dics for some reason
+                              event-tag (if (map? args)
+                                          (dissoc args :key)
+                                          args)))
+        (if debug? (log-diffs :state state new-state))
+        (doseq [[sink [s1 s2]] sink-results]
+          (if (and debug? (or s1 s2)) (log-diffs sink s1 s2)))
+        (if debug? (log-group-end))
+        (reset! state-atom new-state)
         new-state))
 
     (let [post-initial-dispatching-state (->> configs
@@ -453,5 +451,10 @@
                                                         (process-event-wrapper state event-tag args))
                                                       initial-state))]
       (go-loop [state post-initial-dispatching-state]
-        (let [[event-tag args] (<! c)] (recur (process-event-wrapper state event-tag args)))))
-    dispatch))
+               (let [args (<! c)]
+                 (let [[event-tag args] args]
+                   (recur (process-event-wrapper state event-tag args))))))
+    {:dispatch      dispatch
+     :get-state     get-state
+     :dispatch-sync (fn [event args] (process-event-wrapper @state-atom event args) nil)}))
+
