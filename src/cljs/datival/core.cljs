@@ -5,14 +5,13 @@
             [posh.reagent :as posh]
             [reagent.ratom :as r]
             [reagent.core :as reagent]
+            [reagent.impl.component :as rutil]
             [cljs.reader :refer [read-string]]
             [bidi.bidi :as bidi]
             [pushy.core :as pushy]
             [cljs.core.async :refer [put! chan <! >! timeout close!]]
             [ajax.core :as ajax]
             [goog.net.ErrorCode :as errors]))
-
-(enable-console-print!)
 
 (def tempid-atom (atom -1))
 (defn tempid []
@@ -27,22 +26,6 @@
 (defn map-leaves
   [f m]
   (if (map? m) (->> m (map (fn [[k v]] [k (map-leaves f v)])) (into {})) (f m)))
-
-(defn make-ui [conn query funcs]
-  (let [funcs (merge {:id                    (fn [_] [:db/role :anchor])
-                      :setup                 (fn [_])
-                      :component-will-update (fn [])
-                      :component-did-update  (fn [])}
-                     funcs)]
-    (fn [& args]
-      ((:setup funcs) args)
-      (reagent/create-class
-        {:key                   (tempid)
-         :component-will-update (:component-will-update funcs)
-         :component-did-update  (:component-did-update funcs)
-         :reagent-render        (fn [& args]
-                                  (let [res @(posh/pull conn query ((:id funcs) args))]
-                                    ((:render funcs) (conj args res))))}))))
 
 (defn handle-transaction [conn datoms]
   (let [path-cache (atom {})]
@@ -268,60 +251,6 @@
                     response)]
       (on-failure details))))
 
-
-(defn request->xhrio-options
-  [{:keys [dispatch-success
-           dispatch-failure]}
-   {:as   request
-    :keys [on-success on-failure]
-    :or   {on-success [:http-no-on-success]
-           on-failure [:http-no-on-failure]}}]
-  ; wrap events in cljs-ajax callback
-  (let [[_ args-succ] on-success
-        [_ args-fail] on-failure
-        api (new js/goog.net.XhrIo)]
-    (-> request
-        (assoc
-          :api api
-          :handler (partial ajax-xhrio-handler
-                            #(dispatch-success [args-succ %])
-                            #(dispatch-failure [args-fail %])
-                            api))
-        (dissoc :on-success :on-failure))))
-
-(def ajax-system
-  {:sinks {:ajax {:dispatchers (fn [{[event-succ] :on-success
-                                     [event-fail] :on-failure}]
-                                 {:dispatch-success (or event-succ :http-no-on-success)
-                                  :dispatch-failure (or event-fail :http-no-on-failure)})
-                  :body        (fn [request dispatchers]
-                                 (let [seq-request-maps (if (sequential? request) request [request])]
-                                   (doseq [request seq-request-maps]
-                                     (->> request (request->xhrio-options dispatchers) ajax/ajax-request))
-                                   nil))}}})
-
-(defn datascript-system
-  [debug? conn]
-  {:events              {:setup-local-sync (fn [state {{:keys [platform selector key]} :user}]
-                                             (if (= :web platform)
-                                               {:start-local-sync [selector key]}
-                                               {}))}
-   :sources             {:datascript (fn [] @conn)}
-   :sinks               {:datascript       (fn [datoms] (transact! debug? conn datoms))
-                         :start-local-sync (fn [[selector key]] (sync-local-storage conn selector key) nil)}
-   :initial-dispatching (if-let [local-storage-args (:sync-local-storage debug?)]
-                          [[:setup-local-sync local-storage-args]]
-                          [])})
-
-(def dispatch-system
-  {:sinks {:dispatch       {:dispatchers (fn [[event]] {event event})
-                            :body        (fn [[event args] dispatchers]
-                                           ((dispatchers event) args))}
-           :dispatch-after {:dispatchers (fn [[_ event]] {event event})
-                            :body        (fn [[ms event args] dispatchers]
-                                           (js/setTimeout #((dispatchers event) args) ms)
-                                           nil)}}})
-
 (defn route-builder [routes path]
   (if (coll? routes)
     (->> routes
@@ -333,12 +262,88 @@
     [routes path]))
 
 (defn datascript-set-route-event-res
-  [state bidi-res]
+  [bidi-res]
   {:datascript [{:db/path      [[:db/role :anchor]]
                  :root/routing bidi-res}]})
 
-(defn route-system
-  ([routes] (route-system routes {}))
+;;; NEW STUFF
+
+(defn ui-dispatch
+  [dispatch]
+  {:dispatch (fn [events]
+               (fn []
+                 (->> events
+                      (map #(-> [% (fn [args] (dispatch % args))]))
+                      (into {}))))})
+
+(defn ui-datascript
+  [conn]
+  {:datascript (fn [{:keys [id query] :or {id [:db/role :anchor]}}]
+                 (fn [] @(posh/pull conn query id)))})
+
+(def ui-state
+  {:state (fn [args]
+            (let [state (reagent/atom args)]
+              (fn [] {:val @state
+                      :set (fn [v] (reset! state v))
+                      :swap (fn [f] (swap! state f))})))})
+
+(defn req->xhrio-options
+  [ajax-cache
+   {:keys [dispatch-success
+           dispatch-failure]}
+   {:as   request
+    :keys [on-success on-failure]
+    :or   {on-success [:http-no-on-success]
+           on-failure [:http-no-on-failure]}}]
+  (let [[_ args-succ] on-success
+        [_ args-fail] on-failure
+        api (new js/goog.net.XhrIo)]
+    (-> request
+        (assoc
+         :api api
+         :handler (partial ajax-xhrio-handler
+                           (fn [res]
+                             (let [dispatch-id (dispatch-success args-succ)]
+                               (swap! ajax-cache assoc dispatch-id res)))
+                           (fn [err]
+                             (let [dispatch-id (dispatch-failure args-fail)]
+                               (swap! ajax-cache assoc dispatch-id err)))
+                           api))
+        (dissoc :on-success :on-failure))))
+
+(def init-ajax
+  (let [ajax-cache (atom {})]
+    {:sources {:ajax (fn [{:keys [args dispatch-id]}]
+                       (let [id (if (= args :dispatcher)
+                                  dispatch-id
+                                  args)]
+                         (let [res (get @ajax-cache id)]
+                           (swap! ajax-cache dissoc id)
+                           res)))}
+     :sinks {:ajax {:dispatchers (fn [{[event-succ] :on-success
+                                       [event-fail] :on-failure}]
+                                   {:dispatch-success (or event-succ :http-no-on-success)
+                                    :dispatch-failure (or event-fail :http-no-on-failure)})
+                    :body        (fn [{:keys [args dispatchers]}]
+                                   (let [seq-request-maps (if (sequential? args) args [args])]
+                                     (doseq [request seq-request-maps]
+                                       (->> request
+                                            (req->xhrio-options ajax-cache dispatchers)
+                                            ajax/ajax-request))
+                                     nil))}}}))
+
+(defn init-datascript
+  [conn]
+  {:sources {:datascript (fn [{{:keys [query id] :or {id [:db/role :anchor]} :as dsargs} :args}]
+                           (if (= dsargs :raw)
+                             @conn
+                             @(posh/pull conn query id)))}
+   :sinks {:datascript (fn [{:keys [args]}] (transact! false conn args))}})
+
+
+(defn init-routing
+  ([routes] (init-routing routes {}))
   ([routes {:keys [from-location make-set-route-event-res]}]
    (let [routes (route-builder routes [])
          leaves (leaves routes)
@@ -347,114 +352,159 @@
          routes (map-leaves leaf-to-sym routes)
          routes (mapcat identity routes)
          from-location (or from-location #(-> % .-hash (subs 1)))
-         make-set-route-event-res (or make-set-route-event-res (fn [state {bidi-res :user}] {:state (deep-merge state {:routing {:current-route (merge bidi-res {:handler (get leaves {:handler bidi-res})})}})}))]
-     {:events              {:setup-routing (fn [state args] {:start-pushy routes})
-                            :set-route     {:sources [:location]
-                                            :body    (fn [state args]
-                                                       (make-set-route-event-res state
-                                                                                 (update-in args [:user :handler] #(get leaves %))))}}
-      :sources             {:location (fn [] (.-location js/window))}
-      :sinks               {:start-pushy {:dispatchers [:set-route]
-                                          :body        (fn [routes {dispatch :set-route}]
-                                                         (pushy/start!
-                                                           (pushy/pushy dispatch
-                                                                        (fn [_]
-                                                                          (bidi/match-route routes
-                                                                                            (from-location (.-location js/window)))))))}}
-      :initial-dispatching [[:setup-routing]]})))
+         make-set-route-event-res (or make-set-route-event-res
+                                      (fn [args]
+                                        {:state {:routing {:current-route (merge args
+                                                                                 {:handler (get leaves {:handler args})})}}}))]
+     {:events      {:set-route {:body (fn [{:keys [args]}]
+                                        (make-set-route-event-res (update args :handler #(get leaves %))))}}
+      :sinks       {:start-pushy {:dispatchers [:set-route]
+                                  :body        (fn [{routes :args {dispatch :set-route} :dispatchers}]
+                                                 (pushy/start!
+                                                  (pushy/pushy dispatch
+                                                               (fn []
+                                                                 (bidi/match-route routes
+                                                                                   (from-location (.-location js/window)))))))}}
+      :start-pushy routes})))
 
-(defn filter-with-acc
-  ([f l] (filter-with-acc f nil l))
-  ([f i l]
-   (last (reduce (fn [[acc l] v]
-                   (let [[new-acc use?] (f acc v)]
-                     [new-acc (if use? (conj l v) l)])) [i []] l))))
+(def init-dispatch
+  {:sinks {:dispatch {:dispatchers (fn [[event]] {event event})
+                      :body        (fn [{:keys [dispatchers] [event args] :args}]
+                                     ((dispatchers event) args))}
+           :dispatch-after {:dispatchers (fn [[_ event]] {event event})
+                            :body        (fn [{:keys [dispatchers] [ms event args] :args}]
+                                           (js/setTimeout #((dispatchers event) args) ms))}}})
+(defn handle-event-res
+  [dispatch state res]
+  (if (map? res)
+    (let [state (deep-merge state (:state res))
+          sinks (->> res
+                     keys
+                     (sort-by #{:sources :sinks :events})
+                     reverse)]
+      (reduce (fn [state sink]
+                (let [args (res sink)
+                      {:keys [dispatchers body]} (or (get-in state [:_config :sinks sink])
+                                                     {:dispatchers []
+                                                      :body (fn [] {})})
+                      dispatchers (if (fn? dispatchers)
+                                    (->> (dispatchers args)
+                                         (map (fn [[k e]]
+                                                [k #(dispatch e %)]))
+                                         (into {}))
+                                    (->> dispatchers
+                                         (map (fn [e]
+                                                [e #(dispatch e %)]))
+                                         (into {})))]
+                  (handle-event-res dispatch
+                                    state
+                                    (body {:args args
+                                           :dispatchers dispatchers}))))
+              state
+              sinks))
+    state))
 
-(defn make-event-system
-  [debug? configs]
-  (let [make-uniform #(update %1 %2
-                              (fn [config]
-                                (->> config
-                                     (map (fn [[k v]]
-                                            (let [optional-key ({:sources :dependencies
-                                                                 :sinks   :dispatchers
-                                                                 :events  :sources} %2)]
-                                              (if (map? v)
-                                                [k (merge {optional-key []} v)]
-                                                [k {optional-key [] :body v}]))))
-                                     (into {}))))
+(defn make-default-sink
+  [type]
+  (let [optional-key ({:sources :dependencies
+                       :sinks :dispatchers
+                       :events :sources} type)]
+    {type {optional-key []
+           :body (fn [{things :args}]
+                   {:state {:_config {type (->> things
+                                                (map (fn [[k v]]
+                                                       (if (map? v)
+                                                         [k (merge {optional-key []} v)]
+                                                         [k {optional-key [] :body v}])))
+                                                (into {}))}}})}}))
+
+(defn build-event-args
+  [dispatch-id args state sources]
+  (merge
+   (->> sources
+        (mapcat (fn [[source source-args]]
+                  (conj (->> [:_config :sources source :dependencies]
+                             (get-in state)
+                             (map #(-> [% source-args])))
+                        [source source-args])))
+        (reduce (fn [{:keys [args cache]} [source source-args]]
+                  (let [res (or (get cache [source source-args])
+                                ((or (get-in state [:_config :sources source :body])
+                                     (fn [] {})) (merge args {:args source-args})))]
+                    {:args (merge args {source res})
+                     :cache (merge cache {[source source-args] res})}))
+                {:cache {} :args {:state state :dispatch-id dispatch-id}})
+        :args)
+   {:args args}))
+
+(defn create-event-system
+  [initials]
+  (let [dispatch-id-atom (atom 0)
         c (chan)
-        initial-state {:_config (reduce deep-merge
-                                        {}
-                                        (->> configs
-                                             (map (fn [config]
-                                                    (-> config
-                                                        (dissoc :initial-dispatching)
-                                                        (make-uniform :events)
-                                                        (make-uniform :sources)
-                                                        (make-uniform :sinks))))))}
-        state-atom (atom initial-state)
-        dispatch (fn [event args] (go (>! c [event args])) nil)
-        get-state #(-> @state-atom)]
+        state {:_config {:events {}
+                         :sources {:state {:dependencies {}}}
+                         :sinks (->> [:events :sources :sinks]
+                                     (map make-default-sink)
+                                     (reduce merge {}))}}
 
-    (defn process-event
-      [state event-tag args]
-      (let [event (or (get-in state [:_config :events event-tag])
-                      {:body (fn [_ args]
-                               (if debug?
-                                 (log "Unknown event: " event-tag))
-                               {})})
-            all-sources (get-in state [:_config :sources])
-            all-sinks (get-in state [:_config :sinks])
-            args (->> event
-                      :sources
-                      (mapcat #(conj (get-in all-sources [% :dependencies]) %))
-                      (filter-with-acc (fn [used source]
-                                         [(clojure.set/union used #{source}) (not (used source))])
-                                       #{})
-                      (reduce (fn [args source]
-                                (merge args {source ((:body (source all-sources)) args)}))
-                              {:user args}))
-            result (merge {:state state} ((:body event) state args))]
-        [(:state result) (->> (dissoc result :state)
-                              (map (fn [[sink args]]
-                                     (let [{:keys [body dispatchers]} (all-sinks sink)
-                                           dispatchers (if (fn? dispatchers)
-                                                         (->> (dispatchers args)
-                                                              (map (fn [[k e]]
-                                                                     [k #(dispatch e %)]))
-                                                              (into {}))
-                                                         (->> dispatchers
-                                                              (map (fn [e]
-                                                                     [e #(dispatch e %)]))
-                                                              (into {})))]
-                                       [sink ((:body (sink all-sinks)) args dispatchers)]))))]))
+        dispatch (fn [& args]
+                   (let [dispatch-id @dispatch-id-atom]
+                     (swap! dispatch-id-atom inc)
+                     (go (>! c [dispatch-id args]))
+                     dispatch-id))
+        state (reduce (partial handle-event-res dispatch)
+                      state
+                      initials)]
+    (go-loop [state state]
+      (let [[dispatch-id [event args]] (<! c)
+            {:keys [sources body]} (or (get-in state [:_config :events event])
+                                       {:sources {}
+                                        :body (fn [] {})})]
 
-    (defn process-event-wrapper
-      [state event-tag args]
-      (let [[new-state sink-results] (process-event state event-tag args)]
-        (if debug? (log-group "Event subsystem  changes for event:"
-                              ;; TODO: chrome can't handle strings in these dics for some reason
-                              event-tag (if (map? args)
-                                          (dissoc args :key)
-                                          args)))
-        (if debug? (log-diffs :state state new-state))
-        (doseq [[sink [s1 s2]] sink-results]
-          (if (and debug? (or s1 s2)) (log-diffs sink s1 s2)))
-        (if debug? (log-group-end))
-        (reset! state-atom new-state)
-        new-state))
+        (recur (handle-event-res dispatch
+                                 state
+                                 (body (build-event-args dispatch-id args state sources))))))
+    dispatch))
 
-    (let [post-initial-dispatching-state (->> configs
-                                              (mapcat :initial-dispatching)
-                                              (reduce (fn [state [event-tag args]]
-                                                        (process-event-wrapper state event-tag args))
-                                                      initial-state))]
-      (go-loop [state post-initial-dispatching-state]
-               (let [args (<! c)]
-                 (let [[event-tag args] args]
-                   (recur (process-event-wrapper state event-tag args))))))
-    {:dispatch      dispatch
-     :get-state     get-state
-     :dispatch-sync (fn [event args] (process-event-wrapper @state-atom event args) nil)}))
+(defn props-from-component
+  [comp]
+  (let [[_ & props] (.-argv (.-props comp))] props))
+
+(defn create-ui-system
+  [enhancers]
+  (let [enhancers (reduce merge {} enhancers)]
+    (fn [enhancer-func react-methods]
+      (let [args-converter {:component-will-receive-props
+                            (fn [comp [_ & next-props]]
+                              [(props-from-component comp) next-props])
+                            :component-will-update
+                            (fn [comp [_ & next-props]]
+                              [(props-from-component comp) next-props])
+                            :component-did-update
+                            (fn [comp [_ & prev-props]]
+                              [prev-props (props-from-component comp)])
+                            :reagent-render (fn [args] [args])}
+            react-methods (if (fn? react-methods)
+                            {:reagent-render react-methods}
+                            react-methods)
+            component (reagent/create-class
+                       (->> react-methods
+                            (filter (fn [[k v]] (args-converter k)))
+                            (map (fn [[k v]]
+                                   [k (fn [& args]
+                                        (apply v (apply (args-converter k) args)))]))
+                            (into {})))]
+
+        (fn [args]
+          (let [final-enhancers (->> (enhancer-func args)
+                                     (map (fn [[k v]]
+                                            [k ((or (enhancers k)
+                                                    (fn [] (fn [] {}))) v)]))
+                                     (into {}))]
+            (fn [args]
+              [component (merge
+                          (->> final-enhancers
+                               (map (fn [[k v]] [k (v)]))
+                               (into {}))
+                          {:args args})])))))))
 
